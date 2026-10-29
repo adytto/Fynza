@@ -3,6 +3,8 @@ import { supabase } from './lib/supabase';
 
 const CATEGORY_OPTIONS = ['Housing', 'Food', 'Travel', 'Software', 'Health', 'Utilities', 'Salary', 'Freelance', 'Savings', 'Subscriptions', 'Other'];
 const ACCOUNT_OPTIONS = ['Checking', 'Savings', 'Credit'];
+const STORAGE_KEY = 'fynza-demo-mode-v1';
+const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 
 const defaultTransactions = [
   { id: '1', title: 'Monthly salary', type: 'income', amount: 3200, date: '2026-10-03', category: 'Salary', account: 'Checking', notes: 'Monthly salary deposit' },
@@ -15,33 +17,45 @@ const defaultTransactions = [
   { id: '8', title: 'Doctor visit', type: 'expense', amount: 180, date: '2026-10-17', category: 'Health', account: 'Credit', notes: 'Consultation' },
 ];
 
-const STORAGE_KEY = 'fynza-transactions-v1';
-const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+const formatCurrency = (value) => currency.format(value || 0);
 
-const loadTransactions = () => {
+const loadLocalTransactions = () => {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      if (Array.isArray(parsed) && parsed.length) return parsed;
-    }
-  } catch (err) {
-    console.warn('Local storage read failed', err);
+    if (!stored) return defaultTransactions;
+    const parsed = JSON.parse(stored);
+    return Array.isArray(parsed) && parsed.length ? parsed : defaultTransactions;
+  } catch (error) {
+    console.warn('Could not read local storage', error);
+    return defaultTransactions;
   }
-
-  return defaultTransactions;
 };
 
-const formatCurrency = (value) => currency.format(value || 0);
-const formatSignedCurrency = (value) => `${value >= 0 ? '+' : '-'}${formatCurrency(Math.abs(value))}`;
+const mapDbRowToTx = (row) => ({
+  id: String(row.id),
+  title: row.title,
+  type: row.type,
+  amount: Number(row.amount),
+  date: row.date,
+  category: row.category,
+  account: row.account,
+  notes: row.notes || '',
+});
 
 function App() {
-  const [transactions, setTransactions] = useState(loadTransactions);
+  const [session, setSession] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [authForm, setAuthForm] = useState({ email: '', password: '' });
+  const [authMessage, setAuthMessage] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [transactions, setTransactions] = useState(loadLocalTransactions());
   const [selectedMonth, setSelectedMonth] = useState('all');
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [toast, setToast] = useState('');
+  const [syncState, setSyncState] = useState('local');
   const [form, setForm] = useState({
     title: '',
     type: 'expense',
@@ -53,8 +67,57 @@ function App() {
   });
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(transactions));
-  }, [transactions]);
+    if (!supabase) return;
+
+    const restoreSession = async () => {
+      const { data } = await supabase.auth.getSession();
+      setSession(data.session);
+    };
+
+    restoreSession();
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+
+    return () => authListener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!session) {
+      setTransactions(loadLocalTransactions());
+      setSyncState('local');
+      return;
+    }
+
+    if (!supabase) return;
+
+    const fetchRemoteTransactions = async () => {
+      const { data, error } = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('user_id', session.user.id)
+        .order('date', { ascending: false });
+
+      if (!error && Array.isArray(data)) {
+        setTransactions(data.map(mapDbRowToTx));
+        setSyncState('supabase');
+        return;
+      }
+
+      console.warn('Supabase fetch failed', error?.message || error);
+      setTransactions(loadLocalTransactions());
+      setSyncState('local');
+    };
+
+    fetchRemoteTransactions();
+  }, [session]);
+
+  useEffect(() => {
+    if (!session) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(transactions));
+    }
+  }, [session, transactions]);
 
   useEffect(() => {
     if (!toast) return;
@@ -76,8 +139,7 @@ function App() {
     const expense = filteredTransactions.filter((t) => t.type === 'expense').reduce((sum, t) => sum + Number(t.amount), 0);
     const net = income - expense;
     const savings = income - expense;
-    const savingsRate = income > 0 ? (savings / income) * 100 : 0;
-    return { income, expense, net, savings, savingsRate };
+    return { income, expense, net, savings };
   }, [filteredTransactions]);
 
   const budgetData = useMemo(() => {
@@ -86,12 +148,7 @@ function App() {
       spentByCategory[t.category] = (spentByCategory[t.category] || 0) + Number(t.amount);
     });
 
-    const budgetLimits = {
-      Housing: 2100,
-      Food: 700,
-      Travel: 900,
-      Software: 250,
-    };
+    const budgetLimits = { Housing: 2100, Food: 700, Travel: 900, Software: 250 };
 
     return Object.entries(budgetLimits).map(([label, limit]) => ({
       label,
@@ -106,6 +163,7 @@ function App() {
     filteredTransactions.filter((t) => t.type === 'expense').forEach((t) => {
       totals[t.category] = (totals[t.category] || 0) + Number(t.amount);
     });
+
     const total = Object.values(totals).reduce((sum, value) => sum + value, 0) || 1;
     return Object.entries(totals)
       .map(([label, value]) => ({
@@ -118,34 +176,115 @@ function App() {
       .slice(0, 4);
   }, [filteredTransactions]);
 
-  const syncToSupabase = async () => {
-    if (!supabase) return;
+  const saveTransactionLocally = (payload) => {
+    setTransactions((current) => {
+      const exists = current.some((item) => item.id === payload.id);
+      if (exists) {
+        return current.map((item) => (item.id === payload.id ? payload : item));
+      }
+      return [payload, ...current];
+    });
+  };
 
-    try {
-      const { error } = await supabase.from('transactions').upsert(
-        transactions.map((t) => ({
-          id: t.id,
-          title: t.title,
-          amount: Number(t.amount),
-          type: t.type,
-          category: t.category,
-          account: t.account,
-          date: t.date,
-          notes: t.notes || '',
-          user_id: 'demo-user',
-        })),
-        { onConflict: 'id' }
-      );
+  const persistTransaction = async (transaction) => {
+    const userId = session?.user?.id;
 
-      if (error) throw error;
-    } catch (err) {
-      console.warn('Supabase sync skipped:', err.message);
+    if (!supabase || !session || !userId) {
+      saveTransactionLocally(transaction);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('transactions')
+      .upsert({
+        id: transaction.id,
+        user_id: userId,
+        title: transaction.title,
+        type: transaction.type,
+        amount: Number(transaction.amount),
+        date: transaction.date,
+        category: transaction.category,
+        account: transaction.account,
+        notes: transaction.notes || '',
+      }, { onConflict: 'id' });
+
+    if (error) {
+      console.warn('Supabase save error', error.message);
+      saveTransactionLocally(transaction);
+      return;
+    }
+
+    const { data, error: fetchError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('date', { ascending: false });
+
+    if (!fetchError && Array.isArray(data)) {
+      setTransactions(data.map(mapDbRowToTx));
     }
   };
 
-  useEffect(() => {
-    if (supabase) syncToSupabase();
-  }, [transactions]);
+  const removeTransaction = async (id) => {
+    if (supabase && session) {
+      const { error } = await supabase.from('transactions').delete().eq('id', id).eq('user_id', session.user.id);
+      if (!error) {
+        const { data } = await supabase.from('transactions').select('*').eq('user_id', session.user.id).order('date', { ascending: false });
+        if (Array.isArray(data)) setTransactions(data.map(mapDbRowToTx));
+        return;
+      }
+      console.warn('Supabase delete failed', error.message);
+    }
+
+    setTransactions((current) => current.filter((tx) => tx.id !== id));
+  };
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+    setAuthMessage('');
+
+    if (!supabase) {
+      setAuthError('Supabase is not configured yet. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+      return;
+    }
+
+    setIsAuthLoading(true);
+
+    try {
+      if (authMode === 'signup') {
+        const { error } = await supabase.auth.signUp({
+          email: authForm.email,
+          password: authForm.password,
+        });
+
+        if (error) throw error;
+        setAuthMessage('Account created. Check your email for the confirmation link.');
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authForm.email,
+          password: authForm.password,
+        });
+
+        if (error) throw error;
+        setAuthMessage('Signed in successfully.');
+      }
+    } catch (error) {
+      setAuthError(error.message || 'Authentication failed.');
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    setSession(null);
+    setSelectedMonth('all');
+    setSelectedCategory('all');
+    setTransactions(loadLocalTransactions());
+  };
 
   const openCreateModal = () => {
     setEditingId(null);
@@ -156,7 +295,6 @@ function App() {
   const openEditModal = (id) => {
     const tx = transactions.find((item) => item.id === id);
     if (!tx) return;
-
     setEditingId(id);
     setForm({
       title: tx.title,
@@ -170,7 +308,7 @@ function App() {
     setIsModalOpen(true);
   };
 
-  const handleSubmit = (event) => {
+  const handleSubmit = async (event) => {
     event.preventDefault();
 
     if (!form.title.trim() || !form.date || Number(form.amount) <= 0) {
@@ -189,26 +327,65 @@ function App() {
       notes: form.notes.trim(),
     };
 
-    setTransactions((current) => {
-      if (editingId) {
-        return current.map((tx) => (tx.id === editingId ? nextTx : tx));
-      }
-      return [nextTx, ...current];
-    });
+    await persistTransaction(nextTx);
 
     setIsModalOpen(false);
     setToast(editingId ? 'Transaction updated.' : 'Transaction added.');
     setEditingId(null);
   };
 
-  const handleDelete = (id) => {
-    setTransactions((current) => current.filter((tx) => tx.id !== id));
+  const handleDelete = async (id) => {
+    await removeTransaction(id);
     setToast('Transaction deleted.');
   };
 
   const budgetUsed = budgetData.reduce((sum, item) => sum + item.spent, 0) / budgetData.reduce((sum, item) => sum + item.limit, 0);
   const savingsRate = summary.income > 0 ? (summary.savings / summary.income) * 100 : 0;
   const recurring = filteredTransactions.filter((t) => ['Software', 'Utilities', 'Housing', 'Subscriptions'].includes(t.category)).reduce((sum, t) => sum + Number(t.amount), 0);
+
+  if (!session) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <div className="brand-row">
+            <div className="brand-mark">F</div>
+            <div>
+              <div className="brand-title">Fynza</div>
+              <small>Personal finance dashboard</small>
+            </div>
+          </div>
+
+          <div className="auth-toggle">
+            <button type="button" className={authMode === 'login' ? 'toggle active' : 'toggle'} onClick={() => setAuthMode('login')}>Log in</button>
+            <button type="button" className={authMode === 'signup' ? 'toggle active' : 'toggle'} onClick={() => setAuthMode('signup')}>Sign up</button>
+          </div>
+
+          <form className="auth-form" onSubmit={handleAuthSubmit}>
+            <label>
+              <span>Email</span>
+              <input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} required />
+            </label>
+
+            <label>
+              <span>Password</span>
+              <input type="password" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} minLength="6" required />
+            </label>
+
+            {authError && <div className="auth-error">{authError}</div>}
+            {authMessage && <div className="auth-success">{authMessage}</div>}
+
+            <button type="submit" className="button primary full" disabled={isAuthLoading}>
+              {isAuthLoading ? 'Please wait...' : authMode === 'login' ? 'Log in' : 'Create account'}
+            </button>
+          </form>
+
+          <div className="auth-footnote">
+            {supabase ? 'Secure auth is active via Supabase.' : 'Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.'}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -227,8 +404,10 @@ function App() {
           </nav>
 
           <div className="header-actions">
+            <span className="sync-pill">{syncState === 'supabase' ? 'Synced to Supabase' : 'Local demo mode'}</span>
             <button className="button ghost" type="button" onClick={() => setToast('Export started.')}>Export</button>
             <button className="button primary" type="button" onClick={openCreateModal}>Add transaction</button>
+            <button className="button ghost" type="button" onClick={handleSignOut}>Log out</button>
           </div>
         </div>
       </header>
@@ -239,7 +418,7 @@ function App() {
             <div className="card hero-panel">
               <span className="eyebrow">Finance overview</span>
               <h1>Plan smarter, spend clearer.</h1>
-              <p>Track your money in one place with real-time summaries, live budgets, and a clean command center for your monthly cash flow.</p>
+              <p>Track your money in one place with live summaries, budgets, and a clean command center for your monthly cash flow.</p>
               <div className="hero-actions">
                 <button className="button primary" type="button" onClick={openCreateModal}>Open dashboard</button>
                 <button className="button ghost" type="button">View report</button>
@@ -406,8 +585,8 @@ function App() {
               <div className="insight-grid">
                 <div className="insight-item">
                   <span className="label">Savings rate</span>
-                  <strong>{`${savingsRate.toFixed(0)}%`}</strong>
-                  <div className="trend up">▲ {Math.abs(savingsRate).toFixed(1)} pts</div>
+                  <strong>{`${((summary.income > 0 ? summary.savings / summary.income : 0) * 100).toFixed(0)}%`}</strong>
+                  <div className="trend up">▲ {Math.abs((summary.income > 0 ? summary.savings / summary.income : 0) * 100).toFixed(1)} pts</div>
                 </div>
 
                 <div className="insight-item">
